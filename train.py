@@ -28,7 +28,12 @@ from r2_gaussian.utils.cfg_utils import load_config
 from r2_gaussian.utils.log_utils import prepare_output_and_logger
 from r2_gaussian.dataset import Scene
 from r2_gaussian.utils.loss_utils import l1_loss, ssim, tv_3d_loss
-from r2_gaussian.utils.image_utils import metric_vol, metric_proj
+from r2_gaussian.utils.image_utils import (
+    metric_vol,
+    metric_proj,
+    lpips_metric_proj,
+    lpips_metric_vol,
+)
 from r2_gaussian.utils.plot_utils import show_two_slice
 from r2_gaussian.utils.fast_utils import (
     sampling_cameras,
@@ -576,11 +581,14 @@ def training_report(
                 gt_images = torch.concat(gt_images, 0).permute(1, 2, 0)
                 psnr_2d, psnr_2d_projs = metric_proj(gt_images, images, "psnr")
                 ssim_2d, ssim_2d_projs = metric_proj(gt_images, images, "ssim")
+                lpips_2d, lpips_2d_projs = lpips_metric_proj(gt_images, images)
                 eval_dict_2d = {
                     "psnr_2d": psnr_2d,
                     "ssim_2d": ssim_2d,
+                    "lpips_2d": lpips_2d,
                     "psnr_2d_projs": psnr_2d_projs,
                     "ssim_2d_projs": ssim_2d_projs,
+                    "lpips_2d_projs": lpips_2d_projs,
                 }
                 with open(
                     osp.join(eval_save_path, f"eval2d_{config['name']}.yml"),
@@ -605,18 +613,27 @@ def training_report(
                     tb_writer.add_scalar(
                         config["name"] + "/ssim_2d", ssim_2d, iteration
                     )
+                    if lpips_2d is not None:
+                        tb_writer.add_scalar(
+                            config["name"] + "/lpips_2d", lpips_2d, iteration
+                        )
 
         # Evaluate 3D reconstruction performance
         vol_pred = queryFunc(scene.gaussians)["vol"]
         vol_gt = scene.vol_gt
         psnr_3d, _ = metric_vol(vol_gt, vol_pred, "psnr")
         ssim_3d, ssim_3d_axis = metric_vol(vol_gt, vol_pred, "ssim")
+        lpips_3d, lpips_3d_axis = lpips_metric_vol(vol_gt, vol_pred)
         eval_dict = {
             "psnr_3d": psnr_3d,
             "ssim_3d": ssim_3d,
             "ssim_3d_x": ssim_3d_axis[0],
             "ssim_3d_y": ssim_3d_axis[1],
             "ssim_3d_z": ssim_3d_axis[2],
+            "lpips_3d": lpips_3d,
+            "lpips_3d_x": lpips_3d_axis[0] if lpips_3d_axis is not None else None,
+            "lpips_3d_y": lpips_3d_axis[1] if lpips_3d_axis is not None else None,
+            "lpips_3d_z": lpips_3d_axis[2] if lpips_3d_axis is not None else None,
         }
         with open(osp.join(eval_save_path, "eval3d.yml"), "w") as f:
             yaml.dump(eval_dict, f, default_flow_style=False, sort_keys=False)
@@ -644,8 +661,14 @@ def training_report(
             )
             tb_writer.add_scalar("reconstruction/psnr_3d", psnr_3d, iteration)
             tb_writer.add_scalar("reconstruction/ssim_3d", ssim_3d, iteration)
+            if lpips_3d is not None:
+                tb_writer.add_scalar("reconstruction/lpips_3d", lpips_3d, iteration)
+        lpips_3d_str = f"{lpips_3d:.3f}" if lpips_3d is not None else "n/a"
+        lpips_2d_str = f"{lpips_2d:.3f}" if lpips_2d is not None else "n/a"
         tqdm.write(
-            f"[ITER {iteration}] Evaluating: psnr3d {psnr_3d:.3f}, ssim3d {ssim_3d:.3f}, psnr2d {psnr_2d:.3f}, ssim2d {ssim_2d:.3f}"
+            f"[ITER {iteration}] Evaluating: "
+            f"psnr3d {psnr_3d:.3f}, ssim3d {ssim_3d:.3f}, lpips3d {lpips_3d_str}, "
+            f"psnr2d {psnr_2d:.3f}, ssim2d {ssim_2d:.3f}, lpips2d {lpips_2d_str}"
         )
 
         # Record other metrics
