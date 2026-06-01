@@ -193,6 +193,9 @@ def training(
     mv_hard_start_iter=15000,
     mv_refine_start_iter=18000,
     mv_hard_interval=400,
+    mv_soft_vcp_prune_cap=None,
+    mv_hard_vcp_prune_cap=None,
+    min_num_gaussians=None,
 ):
     first_iter = 0
     mv_hard_interval = max(int(mv_hard_interval), 1)
@@ -404,6 +407,13 @@ def training(
                 gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
             )
             gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            # Pick the per-step VCP cap that matches the current stage
+            if mv_stage == "hard":
+                cur_vcp_cap = mv_hard_vcp_prune_cap
+            elif mv_stage == "soft":
+                cur_vcp_cap = mv_soft_vcp_prune_cap
+            else:
+                cur_vcp_cap = None
             if run_mv:
                 before_pts = gaussians.get_xyz.shape[0]
                 gaussians.densify_and_prune(
@@ -419,6 +429,8 @@ def training(
                     importance_thresh=importance_thresh,
                     prune_score_thresh=prune_score_thresh,
                     do_densify=do_densify_mv,
+                    max_vcp_prune_ratio=cur_vcp_cap,
+                    min_num_gaussians=min_num_gaussians,
                 )
                 after_pts = gaussians.get_xyz.shape[0]
                 imp_mean = (
@@ -706,6 +718,12 @@ if __name__ == "__main__":
     parser.add_argument("--mv_hard_start_iter", type=int, default=15000)
     parser.add_argument("--mv_refine_start_iter", type=int, default=18000)
     parser.add_argument("--mv_hard_interval", type=int, default=400)
+    parser.add_argument("--mv_soft_vcp_prune_cap", type=float, default=None,
+                        help="Max ratio of points VCP can prune per soft step (e.g. 0.005 = 0.5%)")
+    parser.add_argument("--mv_hard_vcp_prune_cap", type=float, default=None,
+                        help="Max ratio of points VCP can prune per hard step")
+    parser.add_argument("--min_num_gaussians", type=int, default=None,
+                        help="Hard floor: never let total points drop below this")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     args.test_iterations.append(args.iterations)
@@ -750,6 +768,9 @@ if __name__ == "__main__":
         args.mv_hard_start_iter,
         args.mv_refine_start_iter,
         args.mv_hard_interval,
+        args.mv_soft_vcp_prune_cap,
+        args.mv_hard_vcp_prune_cap,
+        args.min_num_gaussians,
     )
 
     # All done

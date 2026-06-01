@@ -261,6 +261,104 @@ def lpips_metric_vol(img1, img2):
 
 
 @torch.no_grad()
+def metric_vol_per_slice(img1, img2, metric="psnr", axis=2, pixel_max=1.0):
+    """Per-slice PSNR/SSIM along the given axis.
+
+    Args:
+        img1, img2: [x, y, z] volumes (GT, pred)
+        metric: "psnr" or "ssim"
+        axis: 0/1/2 — default 2 (z-axis) matches reconstruction/ slice order
+    Returns:
+        (mean_over_non_empty_slices, per_slice_list)
+    """
+    assert metric in ["psnr", "ssim"]
+    if isinstance(img1, np.ndarray):
+        img1 = torch.from_numpy(img1.copy())
+    if isinstance(img2, np.ndarray):
+        img2 = torch.from_numpy(img2.copy())
+
+    n_slice = img1.shape[axis]
+    results = []
+    valid = []
+    for i in range(n_slice):
+        if axis == 0:
+            slice1, slice2 = img1[i, :, :], img2[i, :, :]
+        elif axis == 1:
+            slice1, slice2 = img1[:, i, :], img2[:, i, :]
+        else:
+            slice1, slice2 = img1[:, :, i], img2[:, :, i]
+
+        if slice1.max() > 0:
+            if metric == "psnr":
+                mse_v = torch.mean((slice1 - slice2) ** 2)
+                if mse_v.item() > 0:
+                    val = float(
+                        (10 * torch.log10(pixel_max**2 / mse_v.float())).item()
+                    )
+                else:
+                    val = float("inf")
+            else:  # ssim
+                val = float(ssim(slice1[None, None], slice2[None, None]).item())
+            results.append(val)
+            if not np.isinf(val):
+                valid.append(val)
+        else:
+            results.append(0.0)
+
+    mean = sum(valid) / max(len(valid), 1) if valid else 0.0
+    return mean, results
+
+
+@torch.no_grad()
+def lpips_metric_vol_per_slice(img1, img2, axis=2):
+    """Per-slice LPIPS along the given axis.
+
+    Args:
+        img1, img2: [x, y, z] volumes (GT, pred)
+        axis: 0/1/2 — default 2 (z-axis) matches reconstruction/ slice order
+    Returns:
+        (mean_over_non_empty_slices, per_slice_list) or (None, None) if LPIPS missing
+    """
+    model = _get_lpips_model()
+    if model is None:
+        return None, None
+
+    if isinstance(img1, np.ndarray):
+        img1 = torch.from_numpy(img1.copy())
+    if isinstance(img2, np.ndarray):
+        img2 = torch.from_numpy(img2.copy())
+    device = next(model.parameters()).device
+
+    n_slice = img1.shape[axis]
+    results = []
+    valid = []
+    for i in range(n_slice):
+        if axis == 0:
+            slice1, slice2 = img1[i, :, :], img2[i, :, :]
+        elif axis == 1:
+            slice1, slice2 = img1[:, i, :], img2[:, i, :]
+        else:
+            slice1, slice2 = img1[:, :, i], img2[:, :, i]
+
+        if slice1.max() > 0:
+            slice1 = slice1 / slice1.max()
+            slice2 = slice2 / slice2.max()
+            d = float(
+                model(
+                    _to_lpips_input(slice1, device),
+                    _to_lpips_input(slice2, device),
+                ).item()
+            )
+            results.append(d)
+            valid.append(d)
+        else:
+            results.append(0.0)
+
+    mean = sum(valid) / max(len(valid), 1) if valid else 0.0
+    return mean, results
+
+
+@torch.no_grad()
 def metric_proj(img1, img2, metric="psnr", axis=2, pixel_max=1.0):
     """Metrics for projection
 

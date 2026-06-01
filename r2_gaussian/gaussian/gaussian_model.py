@@ -551,6 +551,8 @@ class GaussianModel:
             importance_thresh=1.0,
             prune_score_thresh=0.9,
             do_densify=True,
+            max_vcp_prune_ratio=None,
+            min_num_gaussians=None,
     ):
         # ---------- FIX GRADS SHAPE ----------
         grads_raw = self.xyz_gradient_accum / (self.denom + 1e-6)
@@ -609,6 +611,7 @@ class GaussianModel:
             prune_mask |= (self.get_scaling.max(dim=1).values > max_scale)
 
         # ★ pruning_score 应该独立执行
+        base_prune_mask = prune_mask.clone()
         if pruning_score is not None:
             if pruning_score.shape[0] < prune_mask.shape[0]:
                 pad = torch.zeros(
@@ -617,7 +620,56 @@ class GaussianModel:
                 )
                 pruning_score = torch.cat([pruning_score, pad], dim=0)
 
-            prune_mask |= (pruning_score > prune_score_thresh)
+            vcp_candidates = pruning_score > prune_score_thresh
+            # Only count VCP-additional points (exclude those already marked by base rules)
+            vcp_only = vcp_candidates & (~base_prune_mask)
+
+            # ── Safety rail #1: per-step VCP prune cap ──
+            if max_vcp_prune_ratio is not None and max_vcp_prune_ratio >= 0:
+                total_pts = int(base_prune_mask.shape[0])
+                max_vcp = int(total_pts * float(max_vcp_prune_ratio))
+                n_vcp = int(vcp_only.sum().item())
+                if max_vcp <= 0:
+                    vcp_only = torch.zeros_like(vcp_only)
+                elif n_vcp > max_vcp:
+                    # Keep only the top-K highest-score among VCP candidates
+                    idx = torch.nonzero(vcp_only, as_tuple=False).squeeze(-1)
+                    topk = torch.topk(
+                        pruning_score[idx], k=max_vcp, largest=True
+                    ).indices
+                    limited = torch.zeros_like(vcp_only)
+                    limited[idx[topk]] = True
+                    vcp_only = limited
+
+            prune_mask = base_prune_mask | vcp_only
+
+        # ── Safety rail #2: minimum point floor ──
+        if min_num_gaussians is not None and min_num_gaussians > 0:
+            current_pts = int(self.get_xyz.shape[0])
+            n_prune = int(prune_mask.sum().item())
+            survivors = current_pts - n_prune
+            if survivors < min_num_gaussians:
+                # Trim the prune list so we keep at least `min_num_gaussians` points.
+                # Among marked points, keep those with HIGHEST pruning score (most prune-worthy).
+                allowed = max(0, current_pts - int(min_num_gaussians))
+                if allowed == 0:
+                    prune_mask = torch.zeros_like(prune_mask)
+                else:
+                    prune_idx = torch.nonzero(prune_mask, as_tuple=False).squeeze(-1)
+                    if pruning_score is not None:
+                        # Among marked, rank by score, keep top-`allowed`
+                        topk = torch.topk(
+                            pruning_score[prune_idx], k=allowed, largest=True
+                        ).indices
+                        new_mask = torch.zeros_like(prune_mask)
+                        new_mask[prune_idx[topk]] = True
+                        prune_mask = new_mask
+                    else:
+                        # No pruning_score: just keep first `allowed` in index order
+                        new_mask = torch.zeros_like(prune_mask)
+                        if len(prune_idx) > 0:
+                            new_mask[prune_idx[:allowed]] = True
+                        prune_mask = new_mask
 
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()

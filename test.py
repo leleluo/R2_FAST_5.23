@@ -12,6 +12,7 @@
 import os
 import os.path as osp
 import sys
+import csv
 import torch
 from tqdm import tqdm, trange
 import torchvision
@@ -32,7 +33,14 @@ from r2_gaussian.arguments import (
 from r2_gaussian.dataset import Scene
 from r2_gaussian.gaussian import GaussianModel, render, query, initialize_gaussian
 from r2_gaussian.utils.general_utils import safe_state, t2a
-from r2_gaussian.utils.image_utils import metric_vol, metric_proj
+from r2_gaussian.utils.image_utils import (
+    metric_vol,
+    metric_proj,
+    lpips_metric_proj,
+    lpips_metric_vol,
+    metric_vol_per_slice,
+    lpips_metric_vol_per_slice,
+)
 
 
 def testing(
@@ -113,6 +121,12 @@ def evaluate_volume(
 
     psnr_3d, _ = metric_vol(vol_gt, vol_pred, "psnr")
     ssim_3d, ssim_3d_axis = metric_vol(vol_gt, vol_pred, "ssim")
+    lpips_3d, lpips_3d_axis = lpips_metric_vol(vol_gt, vol_pred)
+    # Per-slice metrics along z-axis (axis=2) so slice_id matches reconstruction/*.png
+    _, psnr_3d_per_slice = metric_vol_per_slice(vol_gt, vol_pred, "psnr", axis=2)
+    _, ssim_3d_per_slice = metric_vol_per_slice(vol_gt, vol_pred, "ssim", axis=2)
+    _, lpips_3d_per_slice = lpips_metric_vol_per_slice(vol_gt, vol_pred, axis=2)
+    n_points = int(gaussians.get_xyz.shape[0])
 
     multithread_write(
         [vol_gt[..., i][None] for i in range(vol_gt.shape[2])],
@@ -130,6 +144,11 @@ def evaluate_volume(
         "ssim_3d_x": ssim_3d_axis[0],
         "ssim_3d_y": ssim_3d_axis[1],
         "ssim_3d_z": ssim_3d_axis[2],
+        "lpips_3d": lpips_3d,
+        "lpips_3d_x": lpips_3d_axis[0] if lpips_3d_axis is not None else None,
+        "lpips_3d_y": lpips_3d_axis[1] if lpips_3d_axis is not None else None,
+        "lpips_3d_z": lpips_3d_axis[2] if lpips_3d_axis is not None else None,
+        "n_points": n_points,
     }
 
     with open(osp.join(save_path, "eval3d.yml"), "w") as f:
@@ -147,7 +166,32 @@ def evaluate_volume(
         os.path.join(save_path, "vol_pred.nii.gz"),
     )
 
-    print(f"{name} complete. psnr_3d: {psnr_3d}, ssim_3d: {ssim_3d}")
+    # Per-slice CSV (one row per z-slice, slice_id matches reconstruction/{id:05d}_*.png)
+    csv_path = osp.join(save_path, f"per_slice_{name}.csv")
+    n_slices = len(psnr_3d_per_slice)
+    lpips_list = (
+        lpips_3d_per_slice if lpips_3d_per_slice is not None else [None] * n_slices
+    )
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["slice_id", "psnr_3d", "ssim_3d", "lpips_3d"])
+        for i in range(n_slices):
+            psnr_v = psnr_3d_per_slice[i]
+            ssim_v = ssim_3d_per_slice[i]
+            lpips_v = "" if lpips_list[i] is None else f"{float(lpips_list[i]):.6f}"
+            writer.writerow([
+                i,
+                f"{float(psnr_v):.6f}" if not np.isinf(psnr_v) else "inf",
+                f"{float(ssim_v):.6f}",
+                lpips_v,
+            ])
+
+    lpips_3d_str = f"{lpips_3d:.4f}" if lpips_3d is not None else "n/a"
+    print(
+        f"{name} complete. "
+        f"psnr_3d: {psnr_3d:.3f}, ssim_3d: {ssim_3d:.4f}, lpips_3d: {lpips_3d_str}, "
+        f"n_points: {n_points}"
+    )
 
 
 def evaluate_render(save_path, name, views, gaussians, pipeline):
@@ -174,16 +218,38 @@ def evaluate_render(save_path, name, views, gaussians, pipeline):
     gt_images = torch.concat(gt_list, 0).permute(1, 2, 0)
     psnr_2d, psnr_2d_projs = metric_proj(gt_images, images, "psnr")
     ssim_2d, ssim_2d_projs = metric_proj(gt_images, images, "ssim")
+    lpips_2d, lpips_2d_projs = lpips_metric_proj(gt_images, images)
+    n_points = int(gaussians.get_xyz.shape[0])
     eval_dict = {
         "psnr_2d": psnr_2d,
         "ssim_2d": ssim_2d,
+        "lpips_2d": lpips_2d,
         "psnr_2d_projs": psnr_2d_projs,
         "ssim_2d_projs": ssim_2d_projs,
+        "lpips_2d_projs": lpips_2d_projs,
+        "n_points": n_points,
     }
     with open(osp.join(save_path, f"eval2d_{name}.yml"), "w") as f:
         yaml.dump(eval_dict, f, default_flow_style=False, sort_keys=False)
+
+    # Per-camera CSV (one row per camera, easy to open in Excel)
+    csv_path = osp.join(save_path, f"per_camera_{name}.csv")
+    n_cams = len(psnr_2d_projs)
+    lpips_list = lpips_2d_projs if lpips_2d_projs is not None else [None] * n_cams
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["camera_id", "psnr_2d", "ssim_2d", "lpips_2d"])
+        for i in range(n_cams):
+            psnr_v = float(psnr_2d_projs[i]) if psnr_2d_projs[i] != 0 else 0.0
+            ssim_v = float(ssim_2d_projs[i]) if ssim_2d_projs[i] != 0 else 0.0
+            lpips_v = "" if lpips_list[i] is None else f"{float(lpips_list[i]):.6f}"
+            writer.writerow([i, f"{psnr_v:.6f}", f"{ssim_v:.6f}", lpips_v])
+
+    lpips_2d_str = f"{lpips_2d:.4f}" if lpips_2d is not None else "n/a"
     print(
-        f"{name} complete. psnr_2d: {eval_dict['psnr_2d']}, ssim_2d: {eval_dict['ssim_2d']}."
+        f"{name} complete. "
+        f"psnr_2d: {psnr_2d:.3f}, ssim_2d: {ssim_2d:.4f}, lpips_2d: {lpips_2d_str}, "
+        f"n_points: {n_points}"
     )
 
 
